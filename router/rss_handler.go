@@ -1,19 +1,22 @@
 package router
 
 import (
+	"html"
+	"net/http"
+	"strconv"
+	"time"
+
 	"github.com/NyaaPantsu/nyaa/config"
 	"github.com/NyaaPantsu/nyaa/feeds"
 	userService "github.com/NyaaPantsu/nyaa/service/user"
 	"github.com/NyaaPantsu/nyaa/util"
 	"github.com/NyaaPantsu/nyaa/util/search"
 	"github.com/gorilla/mux"
-	"html"
-	"net/http"
-	"strconv"
-	"time"
 )
 
+// RSSHandler : Controller for displaying rss feed, accepting common search arguments
 func RSSHandler(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
 	vars := mux.Vars(r)
 	page := vars["page"]
 	userID := vars["id"]
@@ -64,7 +67,7 @@ func RSSHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	feed := &feeds.Feed{
 		Title:   "Nyaa Pantsu",
-		Link:    &feeds.Link{Href: "https://" + config.WebAddress + "/"},
+		Link:    &feeds.Link{Href: config.Conf.WebAddress.Nyaa + "/"},
 		Created: createdAsTime,
 	}
 	feed.Items = make([]*feeds.Item, len(torrents))
@@ -72,9 +75,9 @@ func RSSHandler(w http.ResponseWriter, r *http.Request) {
 	for i, torrent := range torrents {
 		torrentJSON := torrent.ToJSON()
 		feed.Items[i] = &feeds.Item{
-			Id:          "https://" + config.WebAddress + "/view/" + torrentJSON.ID,
+			ID:          config.Conf.WebAddress.Nyaa + "/view/" + strconv.FormatUint(uint64(torrentJSON.ID), 10),
 			Title:       torrent.Name,
-			Link:        &feeds.Link{Href: string(torrentJSON.Magnet)},
+			Link:        &feeds.Link{Href: string("<![CDATA[" + torrentJSON.Magnet + "]]>")},
 			Description: string(torrentJSON.Description),
 			Created:     torrent.Date,
 			Updated:     torrent.Date,

@@ -36,6 +36,7 @@ type wrappedHandler struct {
 
 func (wh *wrappedHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	wrw := wrappedResponseWriter{w, false}
+	defer r.Body.Close()
 	wh.h.ServeHTTP(&wrw, r)
 	if wrw.Ignore == true {
 		wrw.Rw.Header().Del("Content-Encoding")
@@ -51,9 +52,10 @@ func wrapHandler(handler http.Handler) http.Handler {
 
 // Make sure the user is a moderator, otherwise return forbidden
 // TODO Clean this
-func WrapModHandler(handler func(w http.ResponseWriter, r *http.Request)) func(w http.ResponseWriter, r *http.Request) {
+func wrapModHandler(handler func(w http.ResponseWriter, r *http.Request)) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		currentUser := GetUser(r)
+		defer r.Body.Close()
+		currentUser := getUser(r)
 		if userPermission.HasAdmin(currentUser) {
 			handler(w, r)
 		} else {

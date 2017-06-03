@@ -109,7 +109,7 @@
   },
   {
     "id":"settings",
-    "translation": "アカウントの設定"
+    "translation": "アカウント設定"
   },
   {
     "id":"torrents",
@@ -544,6 +544,10 @@
     "translation": "説明"
   },
   {
+    "id": "no_description",
+    "translation": "説明はありません。"
+  },
+  {
     "id": "comments",
     "translation": "コメント"
   },
@@ -692,6 +696,10 @@
     "translation": "ファイル一覧"
   },
   {
+    "id": "no_files",
+    "translation": "ファイル一覧が見つからない？もー！意味わかんない！"
+  },
+  {
     "id": "filename",
     "translation": "ファイル名"
   },
@@ -757,7 +765,7 @@
   },
   {
     "id": "last_scraped",
-    "translation": "最終更新日: "
+    "translation": "最終統計日時: "
   },
   {
     "id": "server_status_link",
@@ -961,6 +969,30 @@
   },
   {
     "id": "torrent_nav_deleted",
-    "translation": "Torrent は削除されました"
+    "translation": "Torrent は削除されます"
+  },
+  {
+    "id": "change_settings",
+    "translation": "設定の変更"
+  },
+  {
+    "id": "mascot",
+    "translation": "マスコット"
+  },
+  {
+    "id": "theme",
+    "translation": "テーマ"
+  },
+  {
+    "id": "theme_select",
+    "translation": "-- テーマを選択 --"
+  },
+  {
+    "id": "theme_none",
+    "translation": "なし"
+  },
+  {
+    "id": "mark_as_hidden",
+    "translation": "非表示としてマークする"
   }
 ]

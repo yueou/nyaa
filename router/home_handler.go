@@ -15,11 +15,13 @@ import (
 	"github.com/gorilla/mux"
 )
 
+// HomeHandler : Controller for Home page, can have some query arguments
 func HomeHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	page := vars["page"]
 	messages := msg.GetMessages(r)
 	deleteVar := r.URL.Query()["deleted"]
+	defer r.Body.Close()
 
 	// db params url
 	var err error
@@ -60,19 +62,19 @@ func HomeHandler(w http.ResponseWriter, r *http.Request) {
 		return torrents, nbTorrents, err
 	})
 
-	navigationTorrents := Navigation{
+	navigationTorrents := navigation{
 		TotalItem:      nbTorrents,
 		MaxItemPerPage: maxPerPage,
 		CurrentPage:    pagenum,
 		Route:          "search_page",
 	}
 
-	torrentsJson := model.TorrentsToJSON(torrents)
-	common := NewCommonVariables(r)
+	torrentsJSON := model.TorrentsToJSON(torrents)
+	common := newCommonVariables(r)
 	common.Navigation = navigationTorrents
-	htv := HomeTemplateVariables{
-		CommonTemplateVariables: common,
-		ListTorrents:            torrentsJson,
+	htv := modelListVbs{
+		commonTemplateVariables: common,
+		Models:                  torrentsJSON,
 		Infos:                   messages.GetAllInfos(),
 	}
 

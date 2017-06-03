@@ -1,6 +1,9 @@
 package metainfoFetcher
 
 import (
+	"sync"
+	"time"
+
 	"github.com/NyaaPantsu/nyaa/config"
 	"github.com/NyaaPantsu/nyaa/db"
 	"github.com/NyaaPantsu/nyaa/model"
@@ -10,11 +13,9 @@ import (
 	"github.com/anacrolix/torrent"
 	"github.com/anacrolix/torrent/metainfo"
 	"golang.org/x/time/rate"
-	"math"
-	"sync"
-	"time"
 )
 
+// MetainfoFetcher Struct
 type MetainfoFetcher struct {
 	torrentClient    *torrent.Client
 	results          chan Result
@@ -24,7 +25,7 @@ type MetainfoFetcher struct {
 	baseFailCooldown int
 	maxFailCooldown  int
 	newTorrentsOnly  bool
-	done             chan int
+	done             chan struct{}
 	queue            []*FetchOperation
 	queueMutex       sync.Mutex
 	failedOperations map[uint]time.Time
@@ -34,20 +35,33 @@ type MetainfoFetcher struct {
 	wg               sync.WaitGroup
 }
 
-func New(fetcherConfig *config.MetainfoFetcherConfig) (fetcher *MetainfoFetcher, err error) {
+// New : Creates a MetainfoFetcher struct
+func New(fetcherConfig *config.MetainfoFetcherConfig) (*MetainfoFetcher, error) {
 	clientConfig := torrent.Config{}
+
 	// Well, it seems this is the right way to convert speed -> rate.Limiter
 	// https://github.com/anacrolix/torrent/blob/master/cmd/torrent/main.go
-	if fetcherConfig.UploadRateLimiter != -1 {
-		clientConfig.UploadRateLimiter = rate.NewLimiter(rate.Limit(fetcherConfig.UploadRateLimiter*1024), 256<<10)
+	const uploadBurst = 0x40000 // 256K
+	const downloadBurst = 0x100000 // 1M
+	uploadLimit := fetcherConfig.UploadRateLimitKiB*1024
+	downloadLimit := fetcherConfig.DownloadRateLimitKiB*1024
+	if uploadLimit > 0 {
+		limit := rate.Limit(uploadLimit)
+		limiter := rate.NewLimiter(limit, uploadBurst)
+		clientConfig.UploadRateLimiter = limiter
 	}
-	if fetcherConfig.DownloadRateLimiter != -1 {
-		clientConfig.DownloadRateLimiter = rate.NewLimiter(rate.Limit(fetcherConfig.DownloadRateLimiter*1024), 1<<20)
+	if downloadLimit > 0 {
+		limit := rate.Limit(downloadLimit)
+		limiter := rate.NewLimiter(limit, downloadBurst)
+		clientConfig.DownloadRateLimiter = limiter
 	}
 
 	client, err := torrent.NewClient(&clientConfig)
+	if err != nil {
+		return nil, err
+	}
 
-	fetcher = &MetainfoFetcher{
+	fetcher := &MetainfoFetcher{
 		torrentClient:    client,
 		results:          make(chan Result, fetcherConfig.QueueSize),
 		queueSize:        fetcherConfig.QueueSize,
@@ -56,31 +70,20 @@ func New(fetcherConfig *config.MetainfoFetcherConfig) (fetcher *MetainfoFetcher,
 		newTorrentsOnly:  fetcherConfig.FetchNewTorrentsOnly,
 		baseFailCooldown: fetcherConfig.BaseFailCooldown,
 		maxFailCooldown:  fetcherConfig.MaxFailCooldown,
-		done:             make(chan int, 1),
+		done:             make(chan struct{}, 1),
 		failedOperations: make(map[uint]time.Time),
 		numFails:         make(map[uint]int),
 		wakeUp:           time.NewTicker(time.Second * time.Duration(fetcherConfig.WakeUpInterval)),
 	}
 
-	return
-}
-
-func (fetcher *MetainfoFetcher) isFetchingOrFailed(t model.Torrent) bool {
-	for _, op := range fetcher.queue {
-		if op.torrent.ID == t.ID {
-			return true
-		}
-	}
-
-	_, ok := fetcher.failedOperations[t.ID]
-	return ok
+	return fetcher, nil
 }
 
 func (fetcher *MetainfoFetcher) addToQueue(op *FetchOperation) bool {
 	fetcher.queueMutex.Lock()
 	defer fetcher.queueMutex.Unlock()
 
-	if len(fetcher.queue)+1 > fetcher.queueSize {
+	if fetcher.queueSize > 0 && len(fetcher.queue) > fetcher.queueSize-1 {
 		return false
 	}
 
@@ -195,18 +198,28 @@ func (fetcher *MetainfoFetcher) gotResult(r Result) {
 }
 
 func (fetcher *MetainfoFetcher) removeOldFailures() {
-	// Cooldown is disabled
 	if fetcher.baseFailCooldown < 0 {
+		// XXX: Cooldown is disabled.
+		// this means that if any attempt to fetch metadata fails
+		// it will never be retried. it also means that
+		// fetcher.failedOperations will keep accumulating torrent IDs
+		// that are never freed.
 		return
 	}
 
-	maxCd := time.Duration(fetcher.maxFailCooldown) * time.Second
+	max := time.Duration(fetcher.maxFailCooldown) * time.Second
 	now := time.Now()
 	for id, failTime := range fetcher.failedOperations {
-		cdMult := int(math.Pow(2, float64(fetcher.numFails[id]-1)))
-		cd := time.Duration(cdMult*fetcher.baseFailCooldown) * time.Second
-		if cd > maxCd {
-			cd = maxCd
+		// double the amount of time waited for ever failed attempt.
+		// | nfailed | cooldown
+		// | 1       | 2 * base
+		// | 2       | 4 * base
+		// | 3       | 8 * base
+		// integers inside fetcher.numFails are never less than or equal to zero
+		mul := 1 << uint(fetcher.numFails[id]-1)
+		cd := time.Duration(mul * fetcher.baseFailCooldown) * time.Second
+		if cd > max {
+			cd = max
 		}
 
 		if failTime.Add(cd).Before(now) {
@@ -218,9 +231,8 @@ func (fetcher *MetainfoFetcher) removeOldFailures() {
 }
 
 func (fetcher *MetainfoFetcher) fillQueue() {
-	toFill := fetcher.queueSize - len(fetcher.queue)
-
-	if toFill <= 0 {
+	if left := fetcher.queueSize - len(fetcher.queue); left <= 0 {
+		// queue is already full.
 		return
 	}
 
@@ -230,8 +242,8 @@ func (fetcher *MetainfoFetcher) fillQueue() {
 		excludedIDS = append(excludedIDS, id)
 	}
 
-	tFiles := config.FilesTableName
-	tTorrents := config.TorrentsTableName
+	tFiles := config.Conf.Models.FilesTableName
+	tTorrents := config.Conf.Models.TorrentsTableName
 	// Select the torrents with no filesize, or without any rows with torrent_id in the files table...
 	queryString := "((filesize IS NULL OR filesize = 0) OR (" + tTorrents + ".torrent_id NOT " +
 		"IN (SELECT " + tFiles + ".torrent_id FROM " + tFiles + " WHERE " + tFiles +
@@ -251,7 +263,7 @@ func (fetcher *MetainfoFetcher) fillQueue() {
 	// and, if true, that aren't from the old Nyaa database
 	if fetcher.newTorrentsOnly {
 		queryString += " AND torrent_id > ? "
-		whereParamsArgs = append(whereParamsArgs, config.LastOldTorrentID)
+		whereParamsArgs = append(whereParamsArgs, config.Conf.Models.LastOldTorrentID)
 	}
 
 	params := serviceBase.CreateWhereParams(queryString, whereParamsArgs...)
@@ -268,18 +280,28 @@ func (fetcher *MetainfoFetcher) fillQueue() {
 	}
 
 	for _, T := range dbTorrents {
-		if fetcher.isFetchingOrFailed(T) {
+		for _, v := range fetcher.queue {
+			// skip torrents that are already being processed.
+			if v.torrent.ID == T.ID {
+				continue
+			}
+		}
+		if _, ok := fetcher.failedOperations[T.ID]; ok {
+			// do not start new jobs that have recently failed.
+			// these are on cooldown and will be removed from
+			// fetcher.failedOperations when time is up.
 			continue
 		}
 
 		operation := NewFetchOperation(fetcher, T)
-		if fetcher.addToQueue(operation) {
-			log.Infof("Added TID %d for filesize fetching", T.ID)
-			fetcher.wg.Add(1)
-			go operation.Start(fetcher.results)
-		} else {
+		if !fetcher.addToQueue(operation) {
+			// queue is full, stop and wait for results
 			break
 		}
+
+		log.Infof("Added TID %d for filesize fetching", T.ID)
+		fetcher.wg.Add(1)
+		go operation.Start(fetcher.results)
 	}
 }
 
@@ -288,46 +310,47 @@ func (fetcher *MetainfoFetcher) run() {
 
 	defer fetcher.wg.Done()
 
-	done := 0
-	for done == 0 {
+	for {
 		fetcher.removeOldFailures()
 		fetcher.fillQueue()
+
 		select {
-		case done = <-fetcher.done:
+		case <-fetcher.done:
 			log.Infof("Got done signal on main loop, leaving...")
-			break
+			return
 		case result = <-fetcher.results:
 			fetcher.gotResult(result)
-			break
 		case <-fetcher.wakeUp.C:
 			log.Infof("Got wake up signal...")
-			break
 		}
 	}
 }
 
+// RunAsync method
 func (fetcher *MetainfoFetcher) RunAsync() {
 	fetcher.wg.Add(1)
 
 	go fetcher.run()
 }
 
+// Close method
 func (fetcher *MetainfoFetcher) Close() error {
 	fetcher.queueMutex.Lock()
 	defer fetcher.queueMutex.Unlock()
 
 	// Send the done event to every Operation
 	for _, op := range fetcher.queue {
-		op.done <- 1
+		op.done <- struct{}{}
 	}
 
-	fetcher.done <- 1
+	fetcher.done <- struct{}{}
 	fetcher.torrentClient.Close()
 	log.Infof("Send done signal to everyone, waiting...")
 	fetcher.wg.Wait()
 	return nil
 }
 
+// Wait method
 func (fetcher *MetainfoFetcher) Wait() {
 	fetcher.wg.Wait()
 }

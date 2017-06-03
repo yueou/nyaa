@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"time"
 
+	elastic "gopkg.in/olivere/elastic.v5"
+
 	"github.com/NyaaPantsu/nyaa/config"
 	"github.com/NyaaPantsu/nyaa/db"
 	"github.com/NyaaPantsu/nyaa/model"
@@ -15,12 +17,15 @@ import (
 	"github.com/NyaaPantsu/nyaa/service/upload"
 	"github.com/NyaaPantsu/nyaa/service/user"
 	"github.com/NyaaPantsu/nyaa/service/user/permission"
-	"github.com/NyaaPantsu/nyaa/util/languages"
+	"github.com/NyaaPantsu/nyaa/util/log"
 	msg "github.com/NyaaPantsu/nyaa/util/messages"
+	"github.com/NyaaPantsu/nyaa/util/publicSettings"
 )
 
+// UploadHandler : Main Controller for uploading a torrent
 func UploadHandler(w http.ResponseWriter, r *http.Request) {
-	user := GetUser(r)
+	defer r.Body.Close()
+	user := getUser(r)
 	if !uploadService.IsUploadEnabled(*user) {
 		http.Error(w, "Error uploads are disabled", http.StatusBadRequest)
 		return
@@ -33,10 +38,11 @@ func UploadHandler(w http.ResponseWriter, r *http.Request) {
 	UploadGetHandler(w, r)
 }
 
+// UploadPostHandler : Controller for uploading a torrent, after POST request, redirect or makes error in messages
 func UploadPostHandler(w http.ResponseWriter, r *http.Request) {
-	var uploadForm UploadForm
+	var uploadForm uploadForm
 	defer r.Body.Close()
-	user := GetUser(r)
+	user := getUser(r)
 	messages := msg.GetMessages(r) // new util for errors and infos
 
 	if userPermission.NeedsCaptcha(user) {
@@ -61,7 +67,7 @@ func UploadPostHandler(w http.ResponseWriter, r *http.Request) {
 	torrentIndb := model.Torrent{}
 	db.ORM.Unscoped().Model(&model.Torrent{}).Where("torrent_hash = ?", uploadForm.Infohash).First(&torrentIndb)
 	if torrentIndb.ID > 0 {
-		if userPermission.CurrentUserIdentical(user, torrentIndb.UploaderID) && torrentIndb.IsDeleted() && !torrentIndb.IsBlocked() { // if torrent is not locked and is deleted and the user is the actual owner 
+		if userPermission.CurrentUserIdentical(user, torrentIndb.UploaderID) && torrentIndb.IsDeleted() && !torrentIndb.IsBlocked() { // if torrent is not locked and is deleted and the user is the actual owner
 			torrentService.DefinitelyDeleteTorrent(strconv.Itoa(int(torrentIndb.ID)))
 		} else {
 			messages.AddError("errors", "Torrent already in database !")
@@ -75,23 +81,37 @@ func UploadPostHandler(w http.ResponseWriter, r *http.Request) {
 			Category:    uploadForm.CategoryID,
 			SubCategory: uploadForm.SubCategoryID,
 			Status:      status,
+			Hidden:      uploadForm.Hidden,
 			Hash:        uploadForm.Infohash,
 			Date:        time.Now(),
 			Filesize:    uploadForm.Filesize,
 			Description: uploadForm.Description,
 			WebsiteLink: uploadForm.WebsiteLink,
 			UploaderID:  user.ID}
+		torrent.ParseTrackers(uploadForm.Trackers)
 		db.ORM.Create(&torrent)
+
+		client, err := elastic.NewClient()
+		if err == nil {
+			err = torrent.AddToESIndex(client)
+			if err == nil {
+				log.Infof("Successfully added torrent to ES index.")
+			} else {
+				log.Errorf("Unable to add torrent to ES index: %s", err)
+			}
+		} else {
+			log.Errorf("Unable to create elasticsearch client: %s", err)
+		}
 
 		url, err := Router.Get("view_torrent").URL("id", strconv.FormatUint(uint64(torrent.ID), 10))
 
-		if user.ID > 0 && config.DefaultUserSettings["new_torrent"] { // If we are a member and notifications for new torrents are enabled
-			userService.GetLikings(user) // We populate the liked field for users
-			if len(user.Likings) > 0 {   // If we are followed by at least someone
-				for _, follower := range user.Likings {
+		if user.ID > 0 && config.Conf.Users.DefaultUserSettings["new_torrent"] { // If we are a member and notifications for new torrents are enabled
+			userService.GetFollowers(user) // We populate the liked field for users
+			if len(user.Followers) > 0 {   // If we are followed by at least someone
+				for _, follower := range user.Followers {
 					follower.ParseSettings() // We need to call it before checking settings
 					if follower.Settings.Get("new_torrent") {
-						T, _, _ := languages.TfuncAndLanguageWithFallback(follower.Language, follower.Language) // We need to send the notification to every user in their language
+						T, _, _ := publicSettings.TfuncAndLanguageWithFallback(follower.Language, follower.Language) // We need to send the notification to every user in their language
 
 						notifierService.NotifyUser(&follower, torrent.Identifier(), fmt.Sprintf(T("new_torrent_uploaded"), torrent.Name, user.Username), url.String(), follower.Settings.Get("new_torrent_email"))
 					}
@@ -119,22 +139,24 @@ func UploadPostHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// UploadGetHandler : Controller for uploading a torrent, after GET request or Failed Post request
 func UploadGetHandler(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
 	messages := msg.GetMessages(r) // new util for errors and infos
 
-	var uploadForm UploadForm
+	var uploadForm uploadForm
 	_ = uploadForm.ExtractInfo(r)
-	user := GetUser(r)
+	user := getUser(r)
 	if userPermission.NeedsCaptcha(user) {
 		uploadForm.CaptchaID = captcha.GetID()
 	} else {
 		uploadForm.CaptchaID = ""
 	}
 
-	utv := UploadTemplateVariables{
-		CommonTemplateVariables: NewCommonVariables(r),
-		Upload:                  uploadForm,
-		FormErrors:              messages.GetAllErrors(),
+	utv := formTemplateVariables{
+		commonTemplateVariables: newCommonVariables(r),
+		Form:       uploadForm,
+		FormErrors: messages.GetAllErrors(),
 	}
 	err := uploadTemplate.ExecuteTemplate(w, "index.html", utv)
 	if err != nil {

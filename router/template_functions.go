@@ -8,26 +8,20 @@ import (
 	"time"
 
 	"github.com/NyaaPantsu/nyaa/config"
+	"github.com/NyaaPantsu/nyaa/model"
 	"github.com/NyaaPantsu/nyaa/service/user/permission"
 	"github.com/NyaaPantsu/nyaa/util"
 	"github.com/NyaaPantsu/nyaa/util/categories"
 	"github.com/NyaaPantsu/nyaa/util/filelist"
-	"github.com/NyaaPantsu/nyaa/util/languages"
+	"github.com/NyaaPantsu/nyaa/util/publicSettings"
 )
 
 type captchaData struct {
 	CaptchaID string
-	T         languages.TemplateTfunc
+	T         publicSettings.TemplateTfunc
 }
 
-// Will be reused later.
-func fileSizeFunc(filesize int64, T languages.TemplateTfunc) template.HTML {
-	if (filesize == 0) {
-		return T("unknown")
-	}
-	return template.HTML(util.FormatFilesize(filesize))
-}
-
+// FuncMap : Functions accessible in templates by {{ $.Function }}
 var FuncMap = template.FuncMap{
 	"inc": func(i int) int {
 		return i + 1
@@ -110,14 +104,14 @@ var FuncMap = template.FuncMap{
 
 		return template.HTML(arrows)
 	},
-	"genNav": func(nav Navigation, currentUrl *url.URL, pagesSelectable int) template.HTML {
+	"genNav": func(nav navigation, currentUrl *url.URL, pagesSelectable int) template.HTML {
 		var ret = ""
 		if nav.TotalItem > 0 {
 			maxPages := math.Ceil(float64(nav.TotalItem) / float64(nav.MaxItemPerPage))
 
 			if nav.CurrentPage-1 > 0 {
 				url, _ := Router.Get(nav.Route).URL("page", "1")
-				ret = ret + "<li><a id=\"page-prev\" href=\"" + url.String() + "?" + currentUrl.RawQuery + "\" aria-label=\"Previous\"><span aria-hidden=\"true\">&laquo;</span></a></li>"
+				ret = ret + "<a id=\"page-prev\" href=\"" + url.String() + "?" + currentUrl.RawQuery + "\" aria-label=\"Previous\"><li><span aria-hidden=\"true\">&laquo;</span></li></a>"
 			}
 			startValue := 1
 			if nav.CurrentPage > pagesSelectable/2 {
@@ -133,18 +127,17 @@ var FuncMap = template.FuncMap{
 			for i := startValue; i <= endValue; i++ {
 				pageNum := strconv.Itoa(i)
 				url, _ := Router.Get(nav.Route).URL("page", pageNum)
-				ret = ret + "<li"
+				ret = ret + "<a href=\"" + url.String() + "?" + currentUrl.RawQuery + "\">" + "<li"
 				if i == nav.CurrentPage {
 					ret = ret + " class=\"active\""
 				}
-
-				ret = ret + "><a href=\"" + url.String() + "?" + currentUrl.RawQuery + "\">" + strconv.Itoa(i) + "</a></li>"
+				ret = ret + ">" + strconv.Itoa(i) + "</li></a>"
 			}
 			if nav.CurrentPage < int(maxPages) {
 				url, _ := Router.Get(nav.Route).URL("page", strconv.Itoa(nav.CurrentPage+1))
-				ret = ret + "<li><a id=\"page-next\" href=\"" + url.String() + "?" + currentUrl.RawQuery + "\" aria-label=\"Next\"><span aria-hidden=\"true\">&raquo;</span></a></li>"
+				ret = ret + "<a id=\"page-next\" href=\"" + url.String() + "?" + currentUrl.RawQuery + "\" aria-label=\"Next\"><li><span aria-hidden=\"true\">&raquo;</span></li></a>"
 			}
-			itemsThisPageStart := nav.MaxItemPerPage * (nav.CurrentPage - 1) + 1
+			itemsThisPageStart := nav.MaxItemPerPage*(nav.CurrentPage-1) + 1
 			itemsThisPageEnd := nav.MaxItemPerPage * nav.CurrentPage
 			if nav.TotalItem < itemsThisPageEnd {
 				itemsThisPageEnd = nav.TotalItem
@@ -154,7 +147,7 @@ var FuncMap = template.FuncMap{
 		return template.HTML(ret)
 	},
 	"Sukebei":            config.IsSukebei,
-	"getDefaultLanguage": languages.GetDefaultLanguage,
+	"getDefaultLanguage": publicSettings.GetDefaultLanguage,
 	"getAvatar": func(hash string, size int) string {
 		return "https://www.gravatar.com/avatar/" + hash + "?s=" + strconv.Itoa(size)
 	},
@@ -177,6 +170,7 @@ var FuncMap = template.FuncMap{
 		// because time.* isn't available in templates...
 		return t.Format(time.RFC3339)
 	},
+	"GetHostname": util.GetHostname,
 	"GetCategories": func(keepParent bool) map[string]string {
 		return categories.GetCategoriesSelect(keepParent)
 	},
@@ -185,25 +179,49 @@ var FuncMap = template.FuncMap{
 
 		if category, ok := categories.GetCategories()[s]; ok {
 			return category
-		} else {
-			return ""
 		}
-    },
-    "fileSize": fileSizeFunc,
-	"makeCaptchaData": func(captchaID string, T languages.TemplateTfunc) captchaData {
+		return ""
+	},
+	"fileSize": func(filesize int64, T publicSettings.TemplateTfunc) template.HTML {
+		if filesize == 0 {
+			return T("unknown")
+		}
+		return template.HTML(util.FormatFilesize(filesize))
+	},
+	"makeCaptchaData": func(captchaID string, T publicSettings.TemplateTfunc) captchaData {
 		return captchaData{captchaID, T}
 	},
 	"DefaultUserSettings": func(s string) bool {
-		return config.DefaultUserSettings[s]
+		return config.Conf.Users.DefaultUserSettings[s]
 	},
-	"MakeFolderTreeView": func(f *filelist.FileListFolder, folderFmt string, fileFmt string, data interface{}) template.HTML {
-		out, err := f.MakeFolderTreeView(folderFmt, fileFmt, map[string]interface{}{
-			// Add the functions needed for the tree view here.
-			"fileSize": fileSizeFunc,
-		}, data)
-		if err != nil {
-			return template.HTML("Error while making tree view")
+	"makeTreeViewData": func(f *filelist.FileListFolder, nestLevel int, T publicSettings.TemplateTfunc, identifierChain string) interface{} {
+		return struct {
+			Folder          *filelist.FileListFolder
+			NestLevel       int
+			T               publicSettings.TemplateTfunc
+			IdentifierChain string
+		}{f, nestLevel, T, identifierChain}
+	},
+	"lastID": func(currentUrl url.URL, torrents []model.TorrentJSON) int {
+		values := currentUrl.Query()
+
+		order := false
+		sort := "2"
+
+		if _, ok := values["order"]; ok {
+			order, _ = strconv.ParseBool(values["order"][0])
 		}
-		return out
+		if _, ok := values["sort"]; ok {
+			sort = values["sort"][0]
+		}
+		lastID := 0
+		if sort == "2" || sort == "" {
+			if order {
+				lastID = int(torrents[len(torrents)-1].ID)
+			} else if len(torrents) > 0 {
+				lastID = int(torrents[0].ID)
+			}
+		}
+		return lastID
 	},
 }

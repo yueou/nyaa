@@ -27,12 +27,14 @@ type torrentsQuery struct {
 	Downloads   int `json:"downloads"`
 }
 
+// TorrentsRequest struct
 type TorrentsRequest struct {
 	Query      torrentsQuery `json:"search"`
 	Page       int           `json:"page"`
 	MaxPerPage int           `json:"limit"`
 }
 
+// TorrentRequest struct
 //accept torrent files?
 type TorrentRequest struct {
 	Name        string `json:"name"`
@@ -41,13 +43,17 @@ type TorrentRequest struct {
 	Magnet      string `json:"magnet"`
 	Hash        string `json:"hash"`
 	Description string `json:"description"`
+	Remake      bool   `json:"remake"`
+	WebsiteLink string `json:"website_link"`
 }
 
+// UpdateRequest struct
 type UpdateRequest struct {
 	ID     int            `json:"id"`
 	Update TorrentRequest `json:"update"`
 }
 
+// ToParams : Convert a torrentsrequest to searchparams
 func (r *TorrentsRequest) ToParams() serviceBase.WhereParams {
 	res := serviceBase.WhereParams{}
 	conditions := ""
@@ -90,12 +96,23 @@ func validateSubCategory(r *TorrentRequest) (error, int) {
 	return nil, http.StatusOK
 }
 
+func validateWebsiteLink(r *TorrentRequest) (error, int) {
+	if r.WebsiteLink != "" {
+		// WebsiteLink
+		urlRegexp, _ := regexp.Compile(`^(https?:\/\/|ircs?:\/\/)?([\da-z\.-]+)\.([a-z\.]{2,6})([\/\w \.-]*)*\/?$`)
+		if !urlRegexp.MatchString(r.WebsiteLink) {
+			return ErrWebsiteLink, http.StatusNotAcceptable
+		}
+	}
+	return nil, http.StatusOK
+}
+
 func validateMagnet(r *TorrentRequest) (error, int) {
-	magnetUrl, err := url.Parse(string(r.Magnet)) //?
+	magnetURL, err := url.Parse(string(r.Magnet)) //?
 	if err != nil {
 		return err, http.StatusInternalServerError
 	}
-	xt := magnetUrl.Query().Get("xt")
+	xt := magnetURL.Query().Get("xt")
 	if !strings.HasPrefix(xt, "urn:btih:") {
 		return ErrMagnet, http.StatusNotAcceptable
 	}
@@ -132,6 +149,7 @@ func validateHash(r *TorrentRequest) (error, int) {
 	return nil, http.StatusOK
 }
 
+// ValidateUpload : Check if an upload is valid
 func (r *TorrentRequest) ValidateUpload() (err error, code int) {
 	validators := []func(r *TorrentRequest) (error, int){
 		validateName,
@@ -139,6 +157,7 @@ func (r *TorrentRequest) ValidateUpload() (err error, code int) {
 		validateSubCategory,
 		validateMagnet,
 		validateHash,
+		validateWebsiteLink,
 	}
 
 	for i, validator := range validators {
@@ -153,6 +172,7 @@ func (r *TorrentRequest) ValidateUpload() (err error, code int) {
 	return err, code
 }
 
+// ValidateMultipartUpload : Check if multipart upload is valid
 func (r *TorrentRequest) ValidateMultipartUpload(req *http.Request) (int64, error, int) {
 	tfile, _, err := req.FormFile("torrent")
 	if err == nil {
@@ -170,18 +190,23 @@ func (r *TorrentRequest) ValidateMultipartUpload(req *http.Request) (int64, erro
 			return 0, errors.New("private torrents not allowed"), http.StatusNotAcceptable
 		}
 		trackers := torrent.GetAllAnnounceURLS()
-		if !uploadService.CheckTrackers(trackers) {
+		trackers = uploadService.CheckTrackers(trackers)
+		if len(trackers) == 0 {
 			return 0, errors.New("tracker(s) not allowed"), http.StatusNotAcceptable
 		}
 		if r.Name == "" {
 			r.Name = torrent.TorrentName()
 		}
 
-		binInfohash, err := torrent.Infohash()
+		_, err = tfile.Seek(0, io.SeekStart)
 		if err != nil {
 			return 0, err, http.StatusInternalServerError
 		}
-		r.Hash = strings.ToUpper(hex.EncodeToString(binInfohash[:]))
+		infohash, err := metainfo.DecodeInfohash(tfile)
+		if err != nil {
+			return 0, err, http.StatusInternalServerError
+		}
+		r.Hash = infohash
 
 		// extract filesize
 		filesize := int64(torrent.TotalSize())
@@ -191,6 +216,7 @@ func (r *TorrentRequest) ValidateMultipartUpload(req *http.Request) (int64, erro
 	return 0, err, http.StatusInternalServerError
 }
 
+// ValidateUpdate : Check if an update is valid
 func (r *TorrentRequest) ValidateUpdate() (err error, code int) {
 	validators := []func(r *TorrentRequest) (error, int){
 		validateName,
@@ -198,6 +224,7 @@ func (r *TorrentRequest) ValidateUpdate() (err error, code int) {
 		validateSubCategory,
 		validateMagnet,
 		validateHash,
+		validateWebsiteLink,
 	}
 
 	//don't update not requested values
@@ -217,6 +244,7 @@ func (r *TorrentRequest) ValidateUpdate() (err error, code int) {
 	return err, code
 }
 
+// UpdateTorrent : Update torrent model
 //rewrite with reflect ?
 func (r *UpdateRequest) UpdateTorrent(t *model.Torrent) {
 	if r.Update.Name != "" {
@@ -233,5 +261,8 @@ func (r *UpdateRequest) UpdateTorrent(t *model.Torrent) {
 	}
 	if r.Update.Description != "" {
 		t.Description = r.Update.Description
+	}
+	if r.Update.WebsiteLink != "" {
+		t.WebsiteLink = r.Update.WebsiteLink
 	}
 }

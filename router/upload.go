@@ -1,7 +1,6 @@
 package router
 
 import (
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -25,19 +24,20 @@ import (
 
 // Use this, because we seem to avoid using models, and we would need
 // the torrent ID to create the File in the DB
-type UploadedFile struct {
+type uploadedFile struct {
 	Path     []string
 	Filesize int64
 }
 
-// UploadForm serializing HTTP form for torrent upload
-type UploadForm struct {
+// uploadForm serializing HTTP form for torrent upload
+type uploadForm struct {
 	Name        string
 	Magnet      string
 	Category    string
 	Remake      bool
 	Description string
 	Status      int
+	Hidden      bool
 	CaptchaID   string
 	WebsiteLink string
 
@@ -46,95 +46,99 @@ type UploadForm struct {
 	SubCategoryID int
 	Filesize      int64
 	Filepath      string
-	FileList      []UploadedFile
+	FileList      []uploadedFile
+	Trackers      []string
 }
 
 // TODO: these should be in another package (?)
 
 // form names
-const UploadFormName = "name"
-const UploadFormTorrent = "torrent"
-const UploadFormMagnet = "magnet"
-const UploadFormCategory = "c"
-const UploadFormRemake = "remake"
-const UploadFormDescription = "desc"
-const UploadFormWebsiteLink = "website_link"
-const UploadFormStatus = "status"
+const uploadFormName = "name"
+const uploadFormTorrent = "torrent"
+const uploadFormMagnet = "magnet"
+const uploadFormCategory = "c"
+const uploadFormRemake = "remake"
+const uploadFormDescription = "desc"
+const uploadFormWebsiteLink = "website_link"
+const uploadFormStatus = "status"
+const uploadFormHidden = "hidden"
 
 // error indicating that you can't send both a magnet link and torrent
-var ErrTorrentPlusMagnet = errors.New("Upload either a torrent file or magnet link, not both")
+var errTorrentPlusMagnet = errors.New("Upload either a torrent file or magnet link, not both")
 
 // error indicating a torrent is private
-var ErrPrivateTorrent = errors.New("Torrent is private")
+var errPrivateTorrent = errors.New("Torrent is private")
 
 // error indicating a problem with its trackers
-var ErrTrackerProblem = errors.New("Torrent does not have any (working) trackers: https://" + config.WebAddress + "/faq#trackers")
+var errTrackerProblem = errors.New("Torrent does not have any (working) trackers: " + config.Conf.WebAddress.Nyaa + "/faq#trackers")
 
 // error indicating a torrent's name is invalid
-var ErrInvalidTorrentName = errors.New("Torrent name is invalid")
+var errInvalidTorrentName = errors.New("Torrent name is invalid")
 
 // error indicating a torrent's description is invalid
-var ErrInvalidTorrentDescription = errors.New("Torrent description is invalid")
+var errInvalidTorrentDescription = errors.New("Torrent description is invalid")
 
-// error indicating a torrent's description is invalid
-var ErrInvalidWebsiteLink = errors.New("Website url or IRC link is invalid")
+// error indicating a torrent's website link is invalid
+var errInvalidWebsiteLink = errors.New("Website url or IRC link is invalid")
 
 // error indicating a torrent's category is invalid
-var ErrInvalidTorrentCategory = errors.New("Torrent category is invalid")
+var errInvalidTorrentCategory = errors.New("Torrent category is invalid")
 
 // var p = bluemonday.UGCPolicy()
 
 /**
-UploadForm.ExtractInfo takes an http request and computes all fields for this form
+uploadForm.ExtractInfo takes an http request and computes all fields for this form
 */
-func (f *UploadForm) ExtractInfo(r *http.Request) error {
+func (f *uploadForm) ExtractInfo(r *http.Request) error {
 
-	f.Name = r.FormValue(UploadFormName)
-	f.Category = r.FormValue(UploadFormCategory)
-	f.Description = r.FormValue(UploadFormDescription)
-	f.WebsiteLink = r.FormValue(UploadFormWebsiteLink)
-	f.Status, _ = strconv.Atoi(r.FormValue(UploadFormStatus))
-	f.Magnet = r.FormValue(UploadFormMagnet)
-	f.Remake = r.FormValue(UploadFormRemake) == "on"
+	f.Name = r.FormValue(uploadFormName)
+	f.Category = r.FormValue(uploadFormCategory)
+	f.Description = r.FormValue(uploadFormDescription)
+	f.WebsiteLink = r.FormValue(uploadFormWebsiteLink)
+	f.Status, _ = strconv.Atoi(r.FormValue(uploadFormStatus))
+	f.Magnet = r.FormValue(uploadFormMagnet)
+	f.Remake = r.FormValue(uploadFormRemake) == "on"
+	f.Hidden = r.FormValue(uploadFormHidden) == "on"
 
 	// trim whitespace
-	f.Name = util.TrimWhitespaces(f.Name)
-	f.Description = util.Sanitize(util.TrimWhitespaces(f.Description), "default")
-	f.WebsiteLink = util.TrimWhitespaces(f.WebsiteLink)
-	f.Magnet = util.TrimWhitespaces(f.Magnet)
+	f.Name = strings.TrimSpace(f.Name)
+	f.Description = util.Sanitize(strings.TrimSpace(f.Description), "default")
+	f.WebsiteLink = strings.TrimSpace(f.WebsiteLink)
+	f.Magnet = strings.TrimSpace(f.Magnet)
 	cache.Impl.ClearAll()
+	defer r.Body.Close()
 
 	catsSplit := strings.Split(f.Category, "_")
 	// need this to prevent out of index panics
 	if len(catsSplit) == 2 {
 		CatID, err := strconv.Atoi(catsSplit[0])
 		if err != nil {
-			return ErrInvalidTorrentCategory
+			return errInvalidTorrentCategory
 		}
 		SubCatID, err := strconv.Atoi(catsSplit[1])
 		if err != nil {
-			return ErrInvalidTorrentCategory
+			return errInvalidTorrentCategory
 		}
 
 		if !categories.CategoryExists(f.Category) {
-			return ErrInvalidTorrentCategory
+			return errInvalidTorrentCategory
 		}
 
 		f.CategoryID = CatID
 		f.SubCategoryID = SubCatID
 	} else {
-		return ErrInvalidTorrentCategory
+		return errInvalidTorrentCategory
 	}
 	if f.WebsiteLink != "" {
 		// WebsiteLink
 		urlRegexp, _ := regexp.Compile(`^(https?:\/\/|ircs?:\/\/)?([\da-z\.-]+)\.([a-z\.]{2,6})([\/\w \.-]*)*\/?$`)
 		if !urlRegexp.MatchString(f.WebsiteLink) {
-			return ErrInvalidWebsiteLink
+			return errInvalidWebsiteLink
 		}
 	}
 
 	// first: parse torrent file (if any) to fill missing information
-	tfile, _, err := r.FormFile(UploadFormTorrent)
+	tfile, _, err := r.FormFile(uploadFormTorrent)
 	if err == nil {
 		var torrent metainfo.TorrentFile
 
@@ -150,11 +154,12 @@ func (f *UploadForm) ExtractInfo(r *http.Request) error {
 
 		// check a few things
 		if torrent.IsPrivate() {
-			return ErrPrivateTorrent
+			return errPrivateTorrent
 		}
 		trackers := torrent.GetAllAnnounceURLS()
-		if !uploadService.CheckTrackers(trackers) {
-			return ErrTrackerProblem
+		f.Trackers = uploadService.CheckTrackers(trackers)
+		if len(f.Trackers) == 0 {
+			return errTrackerProblem
 		}
 
 		// Name
@@ -164,14 +169,19 @@ func (f *UploadForm) ExtractInfo(r *http.Request) error {
 
 		// Magnet link: if a file is provided it should be empty
 		if len(f.Magnet) != 0 {
-			return ErrTorrentPlusMagnet
+			return errTorrentPlusMagnet
 		}
-		binInfohash, err := torrent.Infohash()
+
+		_, seekErr = tfile.Seek(0, io.SeekStart)
+		if seekErr != nil {
+			return seekErr
+		}
+		infohash, err := metainfo.DecodeInfohash(tfile)
 		if err != nil {
-			return err
+			return metainfo.ErrInvalidTorrentFile
 		}
-		f.Infohash = strings.ToUpper(hex.EncodeToString(binInfohash[:]))
-		f.Magnet = util.InfoHashToMagnet(f.Infohash, f.Name, trackers...)
+		f.Infohash = infohash
+		f.Magnet = util.InfoHashToMagnet(infohash, f.Name, trackers...)
 
 		// extract filesize
 		f.Filesize = int64(torrent.TotalSize())
@@ -179,18 +189,18 @@ func (f *UploadForm) ExtractInfo(r *http.Request) error {
 		// extract filelist
 		fileInfos := torrent.Info.GetFiles()
 		for _, fileInfo := range fileInfos {
-			f.FileList = append(f.FileList, UploadedFile{
+			f.FileList = append(f.FileList, uploadedFile{
 				Path:     fileInfo.Path,
 				Filesize: int64(fileInfo.Length),
 			})
 		}
 	} else {
 		// No torrent file provided
-		magnetUrl, err := url.Parse(string(f.Magnet)) //?
+		magnetURL, err := url.Parse(string(f.Magnet)) //?
 		if err != nil {
 			return err
 		}
-		xt := magnetUrl.Query().Get("xt")
+		xt := magnetURL.Query().Get("xt")
 		if !strings.HasPrefix(xt, "urn:btih:") {
 			return errors.New("Incorrect magnet")
 		}
@@ -209,18 +219,21 @@ func (f *UploadForm) ExtractInfo(r *http.Request) error {
 				return errors.New("Incorrect hash")
 			}
 		}
+		// TODO: Get Trackers from magnet URL
 		f.Filesize = 0
 		f.Filepath = ""
+
+		return nil
 	}
 
 	// then actually check that we have everything we need
 	if len(f.Name) == 0 {
-		return ErrInvalidTorrentName
+		return errInvalidTorrentName
 	}
 
 	// after data has been checked & extracted, write it to disk
-	if len(config.TorrentFileStorage) > 0 {
-		err := WriteTorrentToDisk(tfile, f.Infohash+".torrent", &f.Filepath)
+	if len(config.Conf.Torrents.FileStorage) > 0 {
+		err := writeTorrentToDisk(tfile, f.Infohash+".torrent", &f.Filepath)
 		if err != nil {
 			return err
 		}
@@ -231,42 +244,44 @@ func (f *UploadForm) ExtractInfo(r *http.Request) error {
 	return nil
 }
 
-func (f *UploadForm) ExtractEditInfo(r *http.Request) error {
-	f.Name = r.FormValue(UploadFormName)
-	f.Category = r.FormValue(UploadFormCategory)
-	f.WebsiteLink = r.FormValue(UploadFormWebsiteLink)
-	f.Description = r.FormValue(UploadFormDescription)
-	f.Status, _ = strconv.Atoi(r.FormValue(UploadFormStatus))
+func (f *uploadForm) ExtractEditInfo(r *http.Request) error {
+	f.Name = r.FormValue(uploadFormName)
+	f.Category = r.FormValue(uploadFormCategory)
+	f.WebsiteLink = r.FormValue(uploadFormWebsiteLink)
+	f.Description = r.FormValue(uploadFormDescription)
+	f.Hidden = r.FormValue(uploadFormHidden) == "on"
+	f.Status, _ = strconv.Atoi(r.FormValue(uploadFormStatus))
 
 	// trim whitespace
-	f.Name = util.TrimWhitespaces(f.Name)
-	f.Description = util.Sanitize(util.TrimWhitespaces(f.Description), "default")
+	f.Name = strings.TrimSpace(f.Name)
+	f.Description = util.Sanitize(strings.TrimSpace(f.Description), "default")
+	defer r.Body.Close()
 
 	catsSplit := strings.Split(f.Category, "_")
 	// need this to prevent out of index panics
 	if len(catsSplit) == 2 {
 		CatID, err := strconv.Atoi(catsSplit[0])
 		if err != nil {
-			return ErrInvalidTorrentCategory
+			return errInvalidTorrentCategory
 		}
 		SubCatID, err := strconv.Atoi(catsSplit[1])
 		if err != nil {
-			return ErrInvalidTorrentCategory
+			return errInvalidTorrentCategory
 		}
 
 		if !categories.CategoryExists(f.Category) {
-			return ErrInvalidTorrentCategory
+			return errInvalidTorrentCategory
 		}
 
 		f.CategoryID = CatID
 		f.SubCategoryID = SubCatID
 	} else {
-		return ErrInvalidTorrentCategory
+		return errInvalidTorrentCategory
 	}
 	return nil
 }
 
-func WriteTorrentToDisk(file multipart.File, name string, fullpath *string) error {
+func writeTorrentToDisk(file multipart.File, name string, fullpath *string) error {
 	_, seekErr := file.Seek(0, io.SeekStart)
 	if seekErr != nil {
 		return seekErr
@@ -275,12 +290,12 @@ func WriteTorrentToDisk(file multipart.File, name string, fullpath *string) erro
 	if err != nil {
 		return err
 	}
-	*fullpath = fmt.Sprintf("%s%c%s", config.TorrentFileStorage, os.PathSeparator, name)
+	*fullpath = fmt.Sprintf("%s%c%s", config.Conf.Torrents.FileStorage, os.PathSeparator, name)
 	return ioutil.WriteFile(*fullpath, b, 0644)
 }
 
-// NewUploadForm creates a new upload form given parameters as list
-func NewUploadForm(params ...string) (uploadForm UploadForm) {
+// newUploadForm creates a new upload form given parameters as list
+func newUploadForm(params ...string) (uploadForm uploadForm) {
 	if len(params) > 1 {
 		uploadForm.Category = params[0]
 	} else {

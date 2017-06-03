@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	elastic "gopkg.in/olivere/elastic.v5"
+
 	"github.com/NyaaPantsu/nyaa/config"
 	"github.com/NyaaPantsu/nyaa/db"
 	"github.com/NyaaPantsu/nyaa/model"
@@ -22,11 +24,13 @@ import (
 	"github.com/gorilla/mux"
 )
 
-func ApiHandler(w http.ResponseWriter, r *http.Request) {
+// APIHandler : Controller for api request on torrent list
+func APIHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	page := vars["page"]
 	whereParams := serviceBase.WhereParams{}
 	req := apiService.TorrentsRequest{}
+	defer r.Body.Close()
 
 	contentType := r.Header.Get("Content-Type")
 	if contentType == "application/json" {
@@ -36,7 +40,7 @@ func ApiHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if req.MaxPerPage == 0 {
-			req.MaxPerPage = config.TorrentsPerPage
+			req.MaxPerPage = config.Conf.Navigation.TorrentsPerPage
 		}
 		if req.Page <= 0 {
 			req.Page = 1
@@ -49,10 +53,10 @@ func ApiHandler(w http.ResponseWriter, r *http.Request) {
 		if maxString != "" {
 			req.MaxPerPage, err = strconv.Atoi(maxString)
 			if !log.CheckError(err) {
-				req.MaxPerPage = config.TorrentsPerPage
+				req.MaxPerPage = config.Conf.Navigation.TorrentsPerPage
 			}
 		} else {
-			req.MaxPerPage = config.TorrentsPerPage
+			req.MaxPerPage = config.Conf.Navigation.TorrentsPerPage
 		}
 
 		req.Page = 1
@@ -75,7 +79,7 @@ func ApiHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	b := model.ApiResultJSON{
+	b := model.APIResultJSON{
 		Torrents: model.TorrentsToJSON(torrents),
 	}
 	b.QueryRecordCount = req.MaxPerPage
@@ -88,11 +92,12 @@ func ApiHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func ApiViewHandler(w http.ResponseWriter, r *http.Request) {
+// APIViewHandler : Controller for viewing a torrent by its ID
+func APIViewHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	id := vars["id"]
 
-	torrent, err := torrentService.GetTorrentById(id)
+	torrent, err := torrentService.GetTorrentByID(id)
 
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
@@ -107,16 +112,19 @@ func ApiViewHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	defer r.Body.Close()
 }
 
-func ApiViewHeadHandler(w http.ResponseWriter, r *http.Request) {
+// APIViewHeadHandler : Controller for checking a torrent by its ID
+func APIViewHeadHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	id, err := strconv.ParseInt(vars["id"], 10, 32)
+	defer r.Body.Close()
 	if err != nil {
 		return
 	}
 
-	_, err = torrentService.GetRawTorrentById(uint(id))
+	_, err = torrentService.GetRawTorrentByID(uint(id))
 
 	if err != nil {
 		NotFoundHandler(w, r)
@@ -126,10 +134,12 @@ func ApiViewHeadHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write(nil)
 }
 
-func ApiUploadHandler(w http.ResponseWriter, r *http.Request) {
+// APIUploadHandler : Controller for uploading a torrent with api
+func APIUploadHandler(w http.ResponseWriter, r *http.Request) {
 	token := r.Header.Get("Authorization")
 	user := model.User{}
 	db.ORM.Where("api_token = ?", token).First(&user) //i don't like this
+	defer r.Body.Close()
 
 	if !uploadService.IsUploadEnabled(user) {
 		http.Error(w, "Error uploads are disabled", http.StatusBadRequest)
@@ -137,7 +147,7 @@ func ApiUploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if user.ID == 0 {
-		http.Error(w, apiService.ErrApiKey.Error(), http.StatusUnauthorized)
+		http.Error(w, apiService.ErrAPIKey.Error(), http.StatusUnauthorized)
 		return
 	}
 
@@ -146,7 +156,6 @@ func ApiUploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	contentType := r.Header.Get("Content-Type")
 	if contentType == "application/json" {
-		defer r.Body.Close()
 
 		d := json.NewDecoder(r.Body)
 		if err := d.Decode(&upload); err != nil {
@@ -164,6 +173,8 @@ func ApiUploadHandler(w http.ResponseWriter, r *http.Request) {
 		upload.Category, _ = strconv.Atoi(r.FormValue("category"))
 		upload.SubCategory, _ = strconv.Atoi(r.FormValue("sub_category"))
 		upload.Description = r.FormValue("description")
+		upload.Remake, _ = strconv.ParseBool(r.FormValue("remake"))
+		upload.WebsiteLink = r.FormValue("website_link")
 
 		var err error
 		var code int
@@ -178,6 +189,7 @@ func ApiUploadHandler(w http.ResponseWriter, r *http.Request) {
 		// create a torrent from it
 		err := fmt.Errorf("Please provide either of Content-Type: application/json header or multipart/form-data").Error()
 		http.Error(w, err, http.StatusInternalServerError)
+		return
 	}
 	var sameTorrents int
 
@@ -188,15 +200,35 @@ func ApiUploadHandler(w http.ResponseWriter, r *http.Request) {
 			Name:        upload.Name,
 			Category:    upload.Category,
 			SubCategory: upload.SubCategory,
-			Status:      1,
+			Status:      model.TorrentStatusNormal,
 			Hash:        upload.Hash,
 			Date:        time.Now(),
 			Filesize:    filesize,
 			Description: upload.Description,
 			UploaderID:  user.ID,
 			Uploader:    &user,
+			WebsiteLink: upload.WebsiteLink,
 		}
+
+		if upload.Remake {
+			torrent.Status = model.TorrentStatusRemake
+		} else if user.IsTrusted() {
+			torrent.Status = model.TorrentStatusTrusted
+		}
+
 		db.ORM.Create(&torrent)
+
+		client, err := elastic.NewClient()
+		if err == nil {
+			err = torrent.AddToESIndex(client)
+			if err == nil {
+				log.Infof("Successfully added torrent to ES index.")
+			} else {
+				log.Errorf("Unable to add torrent to ES index: %s", err)
+			}
+		} else {
+			log.Errorf("Unable to create elasticsearch client: %s", err)
+		}
 		/*if err != nil {
 			util.SendError(w, err, 500)
 			return
@@ -208,11 +240,13 @@ func ApiUploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// APIUpdateHandler : Controller for updating a torrent with api
 // FIXME Impossible to update a torrent uploaded by user 0
-func ApiUpdateHandler(w http.ResponseWriter, r *http.Request) {
+func APIUpdateHandler(w http.ResponseWriter, r *http.Request) {
 	token := r.Header.Get("Authorization")
 	user := model.User{}
 	db.ORM.Where("api_token = ?", token).First(&user) //i don't like this
+	defer r.Body.Close()
 
 	if !uploadService.IsUploadEnabled(user) {
 		http.Error(w, "Error uploads are disabled", http.StatusBadRequest)
@@ -222,11 +256,9 @@ func ApiUpdateHandler(w http.ResponseWriter, r *http.Request) {
 	contentType := r.Header.Get("Content-Type")
 	if contentType == "application/json" {
 		if user.ID == 0 {
-			http.Error(w, apiService.ErrApiKey.Error(), http.StatusForbidden)
+			http.Error(w, apiService.ErrAPIKey.Error(), http.StatusForbidden)
 			return
 		}
-
-		defer r.Body.Close()
 
 		update := apiService.UpdateRequest{}
 		d := json.NewDecoder(r.Body)
@@ -239,7 +271,7 @@ func ApiUpdateHandler(w http.ResponseWriter, r *http.Request) {
 		torrent := model.Torrent{}
 		db.ORM.Where("torrent_id = ?", id).First(&torrent)
 		if torrent.ID == 0 {
-			http.Error(w, apiService.ErrTorrentId.Error(), http.StatusBadRequest)
+			http.Error(w, apiService.ErrTorrentID.Error(), http.StatusBadRequest)
 			return
 		}
 		if torrent.UploaderID != 0 && torrent.UploaderID != user.ID { //&& user.Status != mod
@@ -254,17 +286,15 @@ func ApiUpdateHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		update.UpdateTorrent(&torrent)
 
-		db.ORM.Model(&torrent).UpdateColumn(&torrent)
-		if err != nil {
-			util.SendError(w, err, 500)
-			return
-		}
-		fmt.Printf("%+v\n", torrent)
+		torrentService.UpdateTorrent(torrent)
 	}
 }
-func ApiSearchHandler(w http.ResponseWriter, r *http.Request) {
+
+// APISearchHandler : Controller for searching with api
+func APISearchHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	page := vars["page"]
+	defer r.Body.Close()
 
 	// db params url
 	var err error
@@ -295,5 +325,4 @@ func ApiSearchHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
 }

@@ -1,26 +1,38 @@
 package model
 
 import (
-	"github.com/NyaaPantsu/nyaa/config"
-	"github.com/NyaaPantsu/nyaa/util"
-	"github.com/bradfitz/slice"
-
+	"context"
 	"fmt"
 	"html/template"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
+
+	elastic "gopkg.in/olivere/elastic.v5"
+
+	"net/url"
+
+	"github.com/NyaaPantsu/nyaa/config"
+	"github.com/NyaaPantsu/nyaa/util"
+	"github.com/bradfitz/slice"
 )
 
 const (
-	TorrentStatusNormal    = 1
-	TorrentStatusRemake    = 2
-	TorrentStatusTrusted   = 3
-	TorrentStatusAPlus     = 4
-	TorrentStatusBlocked   = 5
+	// TorrentStatusNormal Int for Torrent status normal
+	TorrentStatusNormal = 1
+	// TorrentStatusRemake Int for Torrent status remake
+	TorrentStatusRemake = 2
+	// TorrentStatusTrusted Int for Torrent status trusted
+	TorrentStatusTrusted = 3
+	// TorrentStatusAPlus Int for Torrent status a+
+	TorrentStatusAPlus = 4
+	// TorrentStatusBlocked Int for Torrent status locked
+	TorrentStatusBlocked = 5
 )
 
+// Feed struct
 type Feed struct {
 	ID        int
 	Name      string
@@ -29,6 +41,7 @@ type Feed struct {
 	Timestamp string
 }
 
+// Torrent model
 type Torrent struct {
 	ID          uint      `gorm:"column:torrent_id;primary_key"`
 	Name        string    `gorm:"column:torrent_name"`
@@ -36,6 +49,7 @@ type Torrent struct {
 	Category    int       `gorm:"column:category"`
 	SubCategory int       `gorm:"column:sub_category"`
 	Status      int       `gorm:"column:status"`
+	Hidden      bool      `gorm:"column:hidden"`
 	Date        time.Time `gorm:"column:date"`
 	UploaderID  uint      `gorm:"column:uploader"`
 	Downloads   int       `gorm:"column:downloads"`
@@ -43,6 +57,7 @@ type Torrent struct {
 	Filesize    int64     `gorm:"column:filesize"`
 	Description string    `gorm:"column:description"`
 	WebsiteLink string    `gorm:"column:website_link"`
+	Trackers    string    `gorm:"column:trackers"`
 	DeletedAt   *time.Time
 
 	Uploader    *User        `gorm:"AssociationForeignKey:UploaderID;ForeignKey:user_id"`
@@ -57,73 +72,122 @@ type Torrent struct {
 	FileList   []File    `gorm:"ForeignKey:torrent_id"`
 }
 
-// Returns the total size of memory recursively allocated for this struct
-// FIXME: doesn't go have sizeof or something nicer for this?
+// Size : Returns the total size of memory recursively allocated for this struct
+// FIXME: Is it deprecated?
 func (t Torrent) Size() (s int) {
-	s += 8 + // ints
-		2*3 + // time.Time
-		2 + // pointers
-		4*2 + // string pointers
-		// string array sizes
-		len(t.Name) + len(t.Hash) + len(t.Description) + len(t.WebsiteLink) +
-		2*2 // array pointers
-	s *= 8 // Assume 64 bit OS
-
-	if t.Uploader != nil {
-		s += t.Uploader.Size()
-	}
-	for _, c := range t.OldComments {
-		s += c.Size()
-	}
-	for _, c := range t.Comments {
-		s += c.Size()
-	}
-
+	s = int(reflect.TypeOf(t).Size())
 	return
 
 }
 
+// TableName : Return the name of torrents table
 func (t Torrent) TableName() string {
-	return config.TorrentsTableName
+	return config.Conf.Models.TorrentsTableName
 }
 
+// Identifier : Return the identifier of a torrent
 func (t *Torrent) Identifier() string {
 	return "torrent_" + strconv.Itoa(int(t.ID))
 }
 
+// IsNormal : Return if a torrent status is normal
 func (t Torrent) IsNormal() bool {
 	return t.Status == TorrentStatusNormal
 }
 
+// IsRemake : Return if a torrent status is normal
 func (t Torrent) IsRemake() bool {
 	return t.Status == TorrentStatusRemake
 }
 
+// IsTrusted : Return if a torrent status is trusted
 func (t Torrent) IsTrusted() bool {
 	return t.Status == TorrentStatusTrusted
 }
 
+// IsAPlus : Return if a torrent status is a+
 func (t Torrent) IsAPlus() bool {
 	return t.Status == TorrentStatusAPlus
 }
 
+// IsBlocked : Return if a torrent status is locked
 func (t *Torrent) IsBlocked() bool {
 	return t.Status == TorrentStatusBlocked
 }
 
+// IsDeleted : Return if a torrent status is deleted
 func (t *Torrent) IsDeleted() bool {
 	return t.DeletedAt != nil
+}
+
+// AddToESIndex : Adds a torrent to Elastic Search
+func (t Torrent) AddToESIndex(client *elastic.Client) error {
+	ctx := context.Background()
+	torrentJSON := t.ToJSON()
+	_, err := client.Index().
+		Index(config.Conf.Search.ElasticsearchIndex).
+		Type(config.Conf.Search.ElasticsearchType).
+		Id(strconv.FormatUint(uint64(torrentJSON.ID), 10)).
+		BodyJson(torrentJSON).
+		Refresh("true").
+		Do(ctx)
+	return err
+}
+
+// DeleteFromESIndex : Removes a torrent from Elastic Search
+func (t Torrent) DeleteFromESIndex(client *elastic.Client) error {
+	ctx := context.Background()
+	_, err := client.Delete().
+		Index(config.Conf.Search.ElasticsearchIndex).
+		Type(config.Conf.Search.ElasticsearchType).
+		Id(strconv.FormatInt(int64(t.ID), 10)).
+		Do(ctx)
+	return err
+}
+
+// ParseTrackers : Takes an array of trackers, adds needed trackers and parse it to url string
+func (t *Torrent) ParseTrackers(trackers []string) {
+	v := url.Values{}
+	if len(config.Conf.Torrents.Trackers.NeededTrackers) > 0 { // if we have some needed trackers configured
+		if len(trackers) == 0 {
+			trackers = config.Conf.Torrents.Trackers.Default
+		} else {
+			for _, id := range config.Conf.Torrents.Trackers.NeededTrackers {
+				found := false
+				for _, tracker := range trackers {
+					if tracker == config.Conf.Torrents.Trackers.Default[id] {
+						found = true
+						break
+					}
+				}
+				if !found {
+					trackers = append(trackers, config.Conf.Torrents.Trackers.Default[id])
+				}
+			}
+		}
+	}
+	v["tr"] = trackers
+	t.Trackers = v.Encode()
+}
+
+// GetTrackersArray : Convert trackers string to Array
+func (t *Torrent) GetTrackersArray() (trackers []string) {
+	v, _ := url.ParseQuery(t.Trackers)
+	trackers = v["tr"]
+	return
 }
 
 /* We need a JSON object instead of a Gorm structure because magnet URLs are
    not in the database and have to be generated dynamically */
 
-type ApiResultJSON struct {
+// APIResultJSON for torrents in json for api
+type APIResultJSON struct {
 	Torrents         []TorrentJSON `json:"torrents"`
 	QueryRecordCount int           `json:"queryRecordCount"`
 	TotalRecordCount int           `json:"totalRecordCount"`
 }
 
+// CommentJSON for comment model in json
 type CommentJSON struct {
 	Username   string        `json:"username"`
 	UserID     int           `json:"user_id"`
@@ -132,13 +196,15 @@ type CommentJSON struct {
 	Date       time.Time     `json:"date"`
 }
 
+// FileJSON for file model in json
 type FileJSON struct {
 	Path     string `json:"path"`
 	Filesize int64  `json:"filesize"`
 }
 
+// TorrentJSON for torrent model in json for api
 type TorrentJSON struct {
-	ID           string        `json:"id"`
+	ID           uint          `json:"id"`
 	Name         string        `json:"name"`
 	Status       int           `json:"status"`
 	Hash         string        `json:"hash"`
@@ -164,7 +230,13 @@ type TorrentJSON struct {
 
 // ToJSON converts a model.Torrent to its equivalent JSON structure
 func (t *Torrent) ToJSON() TorrentJSON {
-	magnet := util.InfoHashToMagnet(strings.TrimSpace(t.Hash), t.Name, config.Trackers...)
+	var trackers []string
+	if t.Trackers == "" {
+		trackers = config.Conf.Torrents.Trackers.Default
+	} else {
+		trackers = t.GetTrackersArray()
+	}
+	magnet := util.InfoHashToMagnet(strings.TrimSpace(t.Hash), t.Name, trackers...)
 	commentsJSON := make([]CommentJSON, 0, len(t.OldComments)+len(t.Comments))
 	for _, c := range t.OldComments {
 		commentsJSON = append(commentsJSON, CommentJSON{Username: c.Username, UserID: -1, Content: template.HTML(c.Content), Date: c.Date.UTC()})
@@ -196,21 +268,26 @@ func (t *Torrent) ToJSON() TorrentJSON {
 	})
 
 	uploader := ""
-	if t.Uploader != nil {
+	var uploaderID uint
+	if t.Hidden {
+		uploader = "れんちょん"
+		uploaderID = 0
+	} else if t.Uploader != nil {
 		uploader = t.Uploader.Username
+		uploaderID = t.UploaderID
 	}
 	torrentlink := ""
-	if t.ID <= config.LastOldTorrentID && len(config.TorrentCacheLink) > 0 {
+	if t.ID <= config.Conf.Models.LastOldTorrentID && len(config.Conf.Torrents.CacheLink) > 0 {
 		if config.IsSukebei() {
 			torrentlink = "" // torrent cache doesn't have sukebei torrents
 		} else {
-			torrentlink = fmt.Sprintf(config.TorrentCacheLink, t.Hash)
+			torrentlink = fmt.Sprintf(config.Conf.Torrents.CacheLink, t.Hash)
 		}
-	} else if t.ID > config.LastOldTorrentID && len(config.TorrentStorageLink) > 0 {
-		torrentlink = fmt.Sprintf(config.TorrentStorageLink, t.Hash)
+	} else if t.ID > config.Conf.Models.LastOldTorrentID && len(config.Conf.Torrents.StorageLink) > 0 {
+		torrentlink = fmt.Sprintf(config.Conf.Torrents.StorageLink, t.Hash)
 	}
 	res := TorrentJSON{
-		ID:           strconv.FormatUint(uint64(t.ID), 10),
+		ID:           t.ID,
 		Name:         t.Name,
 		Status:       t.Status,
 		Hash:         t.Hash,
@@ -221,7 +298,7 @@ func (t *Torrent) ToJSON() TorrentJSON {
 		SubCategory:  strconv.Itoa(t.SubCategory),
 		Category:     strconv.Itoa(t.Category),
 		Downloads:    t.Downloads,
-		UploaderID:   t.UploaderID,
+		UploaderID:   uploaderID,
 		UploaderName: util.SafeText(uploader),
 		OldUploader:  util.SafeText(t.OldUploader),
 		WebsiteLink:  util.Safe(t.WebsiteLink),
@@ -239,7 +316,7 @@ func (t *Torrent) ToJSON() TorrentJSON {
 
 /* Complete the functions when necessary... */
 
-// Map Torrents to TorrentsToJSON without reallocations
+// TorrentsToJSON : Map Torrents to TorrentsToJSON without reallocations
 func TorrentsToJSON(t []Torrent) []TorrentJSON {
 	json := make([]TorrentJSON, len(t))
 	for i := range t {
